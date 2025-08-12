@@ -1,11 +1,13 @@
 import argparse
+import logging
 import sys
 from torch import Tensor
 from gguf import *
 from tinyllava.model.modeling_tinyllava import TinyLlavaForConditionalGeneration
+import huggingface_hub as hf
 
 sys.path.append(Path(__file__).parent.parent.parent.as_posix())
-from convert_hf_to_gguf import Qwen2Model
+from convert_hf_to_gguf import Qwen2Model, Phi2Model, GemmaModel, OpenELMModel
 
 default_image_mean = [0.48145466, 0.4578275, 0.40821073]
 default_image_std = [0.26862954, 0.26130258, 0.27577711]
@@ -26,6 +28,20 @@ def modify_tensors_qwen2(self: Qwen2Model, data_torch: Tensor, name: str, bid: i
 
 
 Qwen2Model.modify_tensors = modify_tensors_qwen2
+
+
+def modify_tensors_others(self, data_torch: Tensor, name: str, bid: int):
+    if "language_model." in name:
+        name = name.replace("language_model.", "")  # for InternVL
+    if name.startswith("vision_tower") or name.startswith("connector"):
+        # skip vision and audio tensors
+        return []
+    yield from super(self.__class__, self).modify_tensors(data_torch, name, bid)
+
+
+Phi2Model.modify_tensors = modify_tensors_others
+GemmaModel.modify_tensors = modify_tensors_others
+OpenELMModel.modify_tensors = modify_tensors_others
 
 
 def k(raw_key: str, arch: str) -> str:
@@ -54,7 +70,7 @@ def get_tensor_name(name: str) -> str:
 
 def options():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-m", "--model-name", help="Path to model directory cloned from HF Hub", required=True)
+    parser.add_argument("-m", "--model-dir", help="Path to model directory cloned from HF Hub", required=True)
     parser.add_argument("-o", "--output-dir", help="Directory to save GGUF files. Default is the currect directory",
                         default=None)
     parser.add_argument("--use-f32", action="store_true", default=False, help="Use f32 instead of f16")
@@ -73,12 +89,13 @@ def options():
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
     else:
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(level=logging.WARNING)
     return args
 
 
 def load_model(args):
-    model = TinyLlavaForConditionalGeneration.from_pretrained(args.model_name, low_cpu_mem_usage=True)
+    model = TinyLlavaForConditionalGeneration.from_pretrained(args.model_dir, low_cpu_mem_usage=True,
+                                                              local_files_only=True)
     print(model)
     image_processor = model.vision_tower._image_processor
     context_len = getattr(model.config, 'max_sequence_length', 2048)
@@ -98,7 +115,8 @@ def write_llm_info(fout, t_hparams, tokens, text_projection_dim=0):
     fout.add_uint32(k(KEY_ATTENTION_HEAD_COUNT, TEXT), t_hparams["num_attention_heads"])
     fout.add_float32(k(KEY_ATTENTION_LAYERNORM_EPS, TEXT), t_hparams.get("layer_norm_eps", 1e-6))
     fout.add_uint32(k(KEY_BLOCK_COUNT, TEXT), t_hparams["num_hidden_layers"])
-    fout.add_token_list(tokens)
+    if tokens is not None:
+        fout.add_token_list(tokens)
     return
 
 
@@ -196,25 +214,25 @@ def write_tensors(fout, model, ftype, ftype_str):
         ftype_cur = 0
         convert_s = ''
         if n_dims == 4:
-            print(f"tensor {name} is always saved in f16")
+            logger.info(f"tensor {name} is always saved in f16")
             data = data.astype(np.float16)
             ftype_cur = 1
         elif ftype == 1:
             if name[-7:] == ".weight" and n_dims == 2:
-                convert_s = ("  Converting to float16")
+                convert_s = "  Converting to float16"
                 data = data.astype(np.float16)
                 ftype_cur = 1
             else:
-                convert_s = ("  Converting to float32")
+                convert_s = "  Converting to float32"
                 data = data.astype(np.float32)
                 ftype_cur = 0
         else:
             if data.dtype != np.float32:
-                convert_s = ("  Converting to float32")
+                convert_s = "  Converting to float32"
                 data = data.astype(np.float32)
                 ftype_cur = 0
 
-        print(f"{name} - {ftype_str[ftype_cur]} - shape = {data.shape}{convert_s}")
+        logger.info(f"{name} - {ftype_str[ftype_cur]} - shape = {data.shape}{convert_s}")
         fout.add_tensor(name, data)
 
 
@@ -222,6 +240,7 @@ def main():
     args = options()
     model, tokenizer, image_processor, context_len = load_model(args)
     config = model.config
+    assert config.connector_type == 'mlp2x_gelu'
     print(config)
     ftype_map: dict[str, gguf.LlamaFileType] = {
         "f32": gguf.LlamaFileType.ALL_F32,
@@ -236,36 +255,58 @@ def main():
     ftype = 1
     if args.use_f32:
         ftype = 0
-    model_dir = Path(
-        '~/.cache/huggingface/hub/models--Zhang199--TinyLLaVA-Qwen2-0.5B-SigLIP/snapshots/6aef66ed2e0125f57a5ec562fe3c0bf1204d8fa3').expanduser()
+    LLM_model = config.llm_model_name_or_path.split('/')[1]
+    print(f'\033[31mLLM model={LLM_model}\033[0m')
+
+    model_dir = Path(args.model_dir).expanduser()
 
     output_dir = Path(args.output_dir) if args.output_dir is not None else Path('.')
     os.makedirs(output_dir, exist_ok=True)
     output_prefix = os.path.basename(output_dir).replace("ggml_", "")
 
+    def converter_get_tensor():
+        state_dict = model.state_dict()
+        for name, value in state_dict.items():
+            if name.startswith('language_model'):
+                yield name, value
+
     ## convert language model to gguf
     fname_out = output_dir / f"model-text-{ftype_str[ftype]}.gguf"
-    instance = Qwen2Model(
-        model_dir, ftype_map[ftype_str[ftype]], fname_out
-    )
-    # instance.hparams.setdefault('layer_norm_rms_eps', 1e-6)
-    # t_hparams = config.text_config.to_dict()
-    # if 'rms_norm_eps' not in t_hparams:
-    instance.gguf_writer.add_float32(k(KEY_ATTENTION_LAYERNORM_RMS_EPS, 'qwen2'), 1e-6)
+    if LLM_model.startswith('Qwen2-'):
+        instance = Qwen2Model(model_dir, ftype_map[ftype_str[ftype]], fname_out)
+        instance.hparams.setdefault('layer_norm_rms_eps', 1e-6)
+        instance.gguf_writer.add_float32(k(KEY_ATTENTION_LAYERNORM_RMS_EPS, 'qwen2'), 1e-6)
+    elif LLM_model.startswith('phi-2'):
+        instance = Phi2Model(model_dir, ftype_map[ftype_str[ftype]], fname_out)
+        instance.hparams.setdefault('num_attention_heads', 32)
+        instance.hparams.setdefault('max_position_embeddings', 32)
+        instance.get_tensors = converter_get_tensor
+    elif LLM_model.startswith('gemma-'):
+        instance = GemmaModel(model_dir, ftype_map[ftype_str[ftype]], fname_out)
+        instance.hparams.setdefault('rms_norm_eps', 1e-6)
+
+    else:
+        raise ValueError(f"Unknown LLM model: {LLM_model}")
+
+    print(instance.hparams)
     logger.info("Exporting model...")
     instance.write()
-    print(instance.hparams)
     logger.info(f"Model successfully exported to {fname_out}")
     # return
     ##
     fname_out = output_dir / f"model-vision-{ftype_str[ftype]}.gguf"
     vocab_path = model_dir / 'vocab.json'
-    # tokens = [key for key in tokenizer.get_vocab()]
-    with vocab_path.open('r') as f:
-        vocab = json.load(f)
-    tokens = [key for key in vocab]  # tokenizer.get_vocab()]
-    print('tokens:', len(tokens), config.vocab_size, tokens[:10], tokens[-10:])
-    print(tokenizer.all_special_ids)
+    if LLM_model.startswith('gemma-'):
+        # TODO: may be error
+        tokens = None
+        pass
+        # tokens = [key for key in tokenizer.get_vocab()]
+    else:
+        with vocab_path.open('r') as f:
+            vocab = json.load(f)
+        tokens = [key for key in vocab]  # tokenizer.get_vocab()]
+        print('tokens:', len(tokens), config.vocab_size, tokens[:10], tokens[-10:])
+        print(tokenizer.all_special_ids)
 
     fout = GGUFWriter(path=fname_out, arch="clip",
                       endianess=GGUFEndian.LITTLE if not args.bigendian else GGUFEndian.BIG)
@@ -273,7 +314,7 @@ def main():
     fout.add_bool("clip.has_vision_encoder", True)
     fout.add_bool("clip.has_llava_projector", False)
     fout.add_file_type(ftype)
-    model_name = os.path.basename(config.name_or_path)
+    model_name = os.path.basename(config.name_or_path)  # TODO: error
     print(f"{model_name=}")
     # if "_name_or_path" in config else os.path.basename(args.model_name)
     fout.add_name(model_name)
@@ -287,7 +328,7 @@ def main():
     fout.write_kv_data_to_file()
     fout.write_tensors_to_file()
     fout.close()
-    print("Done. Output file: ", fname_out)
+    print("\033[31mDone. Output file: ", fname_out, "\033[0m")
     return
 
 

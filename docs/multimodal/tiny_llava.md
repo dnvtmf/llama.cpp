@@ -29,12 +29,13 @@ cd <root>
 
 Then input prompt to load an image:
 
-```shell
+```text
 /image <image_path>
 ```
 
-Now, you can chat with input image. For exmpale,
+Now, you can chat with input image. For exmpale for Qwen2,
 
-```shell
+```text
 How many people in the images?<|im_end|><|img_start|>
+How many cars in the images?<|im_end|><|img_start|>
 ```
