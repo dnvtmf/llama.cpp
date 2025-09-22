@@ -7,20 +7,17 @@ import logging
 import sys
 from pathlib import Path
 from hashlib import sha256
-from typing import Iterable, Sequence, Optional
+from typing import Sequence, Optional
 
 import torch
 from torch import nn, Tensor
 import numpy as np
 import gguf
 from tinyllava.model.modeling_tinyllava import TinyLlavaForConditionalGeneration
-from transformers import Qwen2ForCausalLM, PhiForCausalLM, GemmaForCausalLM
-from transformers import Qwen2Tokenizer, GemmaTokenizer, PreTrainedTokenizer
-from transformers import SiglipVisionModel
+from transformers import Qwen2ForCausalLM, PhiForCausalLM, GemmaForCausalLM, SiglipVisionModel
 
 sys.path.append(Path(__file__).parent.parent.parent.as_posix())
 from convert_hf_to_gguf import SentencePieceTokenTypes
-from convert_hf_to_gguf import Qwen2Model, GemmaModel, Phi2Model
 
 default_image_mean = [0.48145466, 0.4578275, 0.40821073]
 default_image_std = [0.26862954, 0.26130258, 0.27577711]
@@ -57,7 +54,7 @@ def options():
     parser.add_argument("-m", "--model-dir", help="Path to model directory cloned from HF Hub", required=True)
     parser.add_argument("-o", "--output-dir", help="Directory to save GGUF files. Default is the currect directory",
                         default=None)
-    parser.add_argument("--use-f32", action="store_true", default=False, help="Use f32 instead of f16")
+    parser.add_argument("--dtype", default='f32', help="Use f32/f16/bf16/q8_0?")
     parser.add_argument('--bigendian', action="store_true", default=False,
                         help="Model is executed on big-endian machine")
     # Example --image_mean 0.48145466 0.4578275 0.40821073 --image_std 0.26862954 0.26130258 0.27577711
@@ -78,8 +75,8 @@ def options():
 
 
 def load_model(args):
-    model = TinyLlavaForConditionalGeneration.from_pretrained(args.model_dir, low_cpu_mem_usage=True,
-                                                              local_files_only=True)
+    model = TinyLlavaForConditionalGeneration.from_pretrained(
+        args.model_dir, low_cpu_mem_usage=True, local_files_only=True)
     logger.info(model)
     image_processor = model.vision_tower._image_processor
     context_len = getattr(model.config, 'max_sequence_length', 2048)
@@ -283,8 +280,8 @@ class LanguageModel:
                 data_qtype = gguf.GGMLQuantizationType.F16
                 data = gguf.quants.quantize(data, data_qtype)
 
-            shape = gguf.quant_shape_from_byte_shape(data.shape,
-                                                     data_qtype) if data.dtype == np.uint8 else data.shape
+            shape = gguf.quant_shape_from_byte_shape(
+                data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
 
             # reverse shape to make it similar to the internal ggml dimension order
             shape_str = f"{{{', '.join(str(n) for n in reversed(shape))}}}"
@@ -1007,42 +1004,109 @@ class VisionModel:
         use_gelu = v_hparams["hidden_act"] == "gelu"
         self.gguf_writer.add_bool("clip.use_gelu", use_gelu)
 
+    def match_model_tensor_name(
+        self, name: str, key: gguf.MODEL_TENSOR, bid: int | None, suffix: str = ".weight") -> bool:
+        if key not in gguf.MODEL_TENSORS[self.model_arch]:
+            return False
+        key_name: str = gguf.TENSOR_NAMES[key]
+        if "{bid}" in key_name:
+            if bid is None:
+                return False
+            key_name = key_name.format(bid=bid)
+        else:
+            if bid is not None:
+                return False
+        return name == (key_name + suffix)
+
     def prepare_tensors(self):
         state_dict = self.model.state_dict()
         fmt = "{:%ds}, {} --> {}, shape = {}" % max(len(name) for name in state_dict.keys())
-        for name, data in state_dict.items():
-
-            name = get_tensor_name(name)
-            data = data.squeeze().numpy()
+        for name, data_torch in state_dict.items():
+            if name.startswith('language_model.'):
+                continue
+            # convert any unsupported data types to float32
+            if data_torch.dtype not in (torch.float16, torch.float32):
+                data_torch = data_torch.to(torch.float32)
+            data = data_torch.squeeze().numpy()
             old_dtype = data.dtype
 
+            new_name = get_tensor_name(name)
             n_dims = len(data.shape)
 
-            # ftype == 0 -> float32, ftype == 1 -> float16
-            ftype_cur = 0
-            convert_s = ''
-            if n_dims == 4:
-                logger.info(f"tensor {name} is always saved in f16")
-                data = data.astype(np.float16)
-                ftype_cur = 1
-            elif self.ftype == gguf.LlamaFileType.MOSTLY_F16:
-                if name[-7:] == ".weight" and n_dims == 2:
-                    convert_s = "  Converting to float16"
-                    data = data.astype(np.float16)
-                    ftype_cur = 1
-                else:
-                    convert_s = "  Converting to float32"
-                    data = data.astype(np.float32)
-                    ftype_cur = 0
-            else:
-                if data.dtype != np.float32:
-                    convert_s = "  Converting to float32"
-                    data = data.astype(np.float32)
-                    ftype_cur = 0
+            bid = None
+            for part in name.split("."):
+                if part.isdecimal():
+                    bid = int(part)
+                    break
+            data_qtype = False
+            # Most of the codebase that takes in 1D tensors or norms only handles F32 tensors
+            if n_dims <= 1 or new_name.endswith("_norm.weight"):
+                data_qtype = gguf.GGMLQuantizationType.F32
 
-            shape_str = f"{{{', '.join(str(n) for n in reversed(data.shape))}}}"
-            logger.debug(fmt.format(name, old_dtype, data.dtype, shape_str))
-            self.gguf_writer.add_tensor(name, data)
+            # Conditions should closely match those in llama_model_quantize_internal in llama.cpp
+            # Some tensor types are always in float32
+            if data_qtype is False and (any(self.match_model_tensor_name(new_name, key, bid) for key in (
+                    gguf.MODEL_TENSOR.FFN_GATE_INP,
+                    gguf.MODEL_TENSOR.POS_EMBD,
+                    gguf.MODEL_TENSOR.TOKEN_TYPES,
+                    gguf.MODEL_TENSOR.SSM_CONV1D,
+                    gguf.MODEL_TENSOR.SHORTCONV_CONV,
+                    gguf.MODEL_TENSOR.TIME_MIX_FIRST,
+                    gguf.MODEL_TENSOR.TIME_MIX_W1,
+                    gguf.MODEL_TENSOR.TIME_MIX_W2,
+                    gguf.MODEL_TENSOR.TIME_MIX_DECAY_W1,
+                    gguf.MODEL_TENSOR.TIME_MIX_DECAY_W2,
+                    gguf.MODEL_TENSOR.TIME_MIX_LERP_FUSED,
+                    gguf.MODEL_TENSOR.POSNET_NORM1,
+                    gguf.MODEL_TENSOR.POSNET_NORM2,
+                    gguf.MODEL_TENSOR.V_ENC_EMBD_POS,
+                    gguf.MODEL_TENSOR.A_ENC_EMBD_POS,
+                    gguf.MODEL_TENSOR.ALTUP_CORRECT_COEF,
+                    gguf.MODEL_TENSOR.ALTUP_PREDICT_COEF,
+            )) or not new_name.endswith(".weight")):
+                data_qtype = gguf.GGMLQuantizationType.F32
+
+            if data_qtype is False and any(self.match_model_tensor_name(new_name, key, bid) for key in (
+                    gguf.MODEL_TENSOR.TOKEN_EMBD,
+                    gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD,
+                    gguf.MODEL_TENSOR.OUTPUT,
+                    gguf.MODEL_TENSOR.ALTUP_ROUTER,
+                    gguf.MODEL_TENSOR.LAUREL_L,
+                    gguf.MODEL_TENSOR.LAUREL_R,
+            )):
+                if self.ftype in (gguf.LlamaFileType.MOSTLY_TQ1_0, gguf.LlamaFileType.MOSTLY_TQ2_0):
+                    data_qtype = gguf.GGMLQuantizationType.F16
+
+            # No override (data_qtype is False), or wants to be quantized (data_qtype is True)
+            if isinstance(data_qtype, bool):
+                if self.ftype == gguf.LlamaFileType.ALL_F32:
+                    data_qtype = gguf.GGMLQuantizationType.F32
+                elif self.ftype == gguf.LlamaFileType.MOSTLY_F16:
+                    data_qtype = gguf.GGMLQuantizationType.F16
+                elif self.ftype == gguf.LlamaFileType.MOSTLY_BF16:
+                    data_qtype = gguf.GGMLQuantizationType.BF16
+                elif self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0:
+                    data_qtype = gguf.GGMLQuantizationType.Q8_0
+                elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ1_0:
+                    data_qtype = gguf.GGMLQuantizationType.TQ1_0
+                elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:
+                    data_qtype = gguf.GGMLQuantizationType.TQ2_0
+                else:
+                    raise ValueError(f"Unknown file type: {self.ftype.name}")
+
+            try:
+                data = gguf.quants.quantize(data, data_qtype)
+            except gguf.QuantError as e:
+                logger.warning("%s, %s", e, "falling back to F16")
+                data_qtype = gguf.GGMLQuantizationType.F16
+                data = gguf.quants.quantize(data, data_qtype)
+            shape = gguf.quant_shape_from_byte_shape(
+                data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
+
+            # reverse shape to make it similar to the internal ggml dimension order
+            shape_str = f"{{{', '.join(str(n) for n in reversed(shape))}}}"
+            logger.debug(fmt.format(new_name, old_dtype, data_qtype.name, shape_str))
+            self.gguf_writer.add_tensor(new_name, data, raw_dtype=data_qtype)
 
     def prepare_connector_tensors(self):
         tensors = self.model.connector.state_dict()
@@ -1067,10 +1131,9 @@ def main():
         "tq2_0": gguf.LlamaFileType.MOSTLY_TQ2_0,
         "auto": gguf.LlamaFileType.GUESSED,
     }
-    ftype_str = ["f32", "f16"]
-    ftype = 1
-    if args.use_f32:
-        ftype = 0
+    ftype_str = args.dtype
+    assert ftype_str in ftype_map
+    ftype = ftype_map[ftype_str]
     LLM_model = config.llm_model_name_or_path.split('/')[1]
     logger.info(f'\033[31mLLM model={LLM_model}\033[0m')
 
@@ -1082,24 +1145,27 @@ def main():
     tokenizer.save_pretrained(output_dir)
 
     ## convert language model to gguf
-    fname_out = output_dir / f"model-text-{ftype_str[ftype]}.gguf"
-    instance = LanguageModel(model.language_model, model_dir, ftype_map[ftype_str[ftype]])
+    fname_out = output_dir / f"model-text-{ftype_str}.gguf"
+    instance = LanguageModel(model.language_model, model_dir, ftype)
     logger.info("Exporting language model...")
     instance.write(fname_out)
     logger.info(f"\033[31mLanguage Model successfully exported to {fname_out}\033[0m")
 
     ## convert vision model and connector to gguf
-    fname_out = output_dir / f"model-vision-{ftype_str[ftype]}.gguf"
-    vision_instance = VisionModel(model, ftype_map[ftype_str[ftype]])
+    fname_out = output_dir / f"model-vision-{ftype_str}.gguf"
+    vision_instance = VisionModel(model, ftype)
     vocab_path = output_dir / 'vocab.json'
-    with vocab_path.open('r') as f:
-        vocab = json.load(f)
-    tokens = [key for key in vocab]  # tokenizer.get_vocab()]
+    if vocab_path.exists():
+        with vocab_path.open('r') as f:
+            vocab = json.load(f)
+        tokens = [key for key in vocab]  # tokenizer.get_vocab()]
+    else:
+        tokens = None
     # print('tokens:', len(tokens), config.vocab_size)  # , tokens[:10], tokens[-10:])
     # print(tokenizer.all_special_ids)
     logger.info("Exporting vision model...")
     vision_instance.write(fname_out, tokens)
-    logger.info(f"\033[31mVission Model successfully exported to {fname_out}\033[0m")
+    logger.info(f"\033[31mVision Model successfully exported to {fname_out}\033[0m")
     return
 
 
